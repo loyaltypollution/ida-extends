@@ -1,4 +1,5 @@
 import typing
+import warnings
 
 import idautils
 import ida_idd
@@ -130,6 +131,6 @@ def apply_type_from_name(ea: int, type_string: str) -> ida_idaapi.object_t:
 	:rtype: ida_idaapi.object_t
 	"""
 	tif = idaapi.create_typedef(type_string)
-	tp = Appcall.typedobj(tif)
+	tp = ida_idd.Appcall.typedobj(tif)
 	ok, r = tp.retrieve(ea)
 	return r
