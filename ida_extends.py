@@ -8,7 +8,8 @@ import ida_name
 import ida_nalt
 import ida_typeinf
 import idaapi
-import idc
+
+from contextlib import suppress
 
 def apply_cdecl(ea: int, decl: str) -> ida_idaapi.object_t:
     """
@@ -55,49 +56,72 @@ def get_func_type_from_til(func_name: str) -> ida_typeinf.tinfo_t:
         tif.deserialize(sym.til, type_str, fields_str)
     return tif
 
+def alloc_from_cdecl(ea, decl, kw_params):
+    tp = ida_idd.Appcall.typedobj(decl)
+    o  = ida_idd.Appcall.obj(**kw_params)
+    success = tp.store(o, ea)
+    return success == 0
 
+def alloc_from_named_type(ea, type_string, kw_params):
+    tif = ida_typeinf.tinfo_t()
+    tif.create_typedef(ida_typeinf.get_idati(), type_string)
+    ida_typeinf.apply_tinfo(ea, tif, 0)
+    
+    tp = ida_idd.Appcall.typedobj(tif)
+    o  = ida_idd.Appcall.obj(**kw_params)
+    success = tp.store(o, ea)
+    return success == 0
 
 def LoadLibrary(module: str) -> int:
     """
     Loads DLL in IDA database from module name.
+    Only runs if debugger is present.
 
-    :returns: effective eaess of module name.
+    :returns: effective address of module name.
     :rtype: int
     """
+    if not ida_dbg.is_debugger_on:
+        return
+
     if not module.endswith(".dll"):
         module += ".dll"
-    # ida_inf = idaapi.get_inf_structure()
-    # if ida_inf.is_64bit() == 64:
-    #     ida_typeinf.add_til("ntapi64_win10", ida_typeinf.ADDTIL_DEFAULT)
-    #     func_addressing_size = 8
-    # elif ida_inf.is_32bit() == 32:
-    #     ida_typeinf.add_til("ntapi_win10", ida_typeinf.ADDTIL_DEFAULT)
-    #     func_addressing_size = 4
-    # else:
-    #     warnings.warn('unsure of system type, unable to load ntapi til', Warning)
-    #     return None
+    ida_inf = idaapi.get_inf_structure()
 
-    # size = idaapi.get_struc_size(idc.import_type(-1, "UNICODE_STRING"))    
-    # RtlCreateHeap = WinAPI("ntdll.dll", "RtlCreateHeap")
-    # RtlAllocateHeap = WinAPI("ntdll.dll", "RtlAllocateHeap")
+    # attempt to use kernel32 LoadLibraryA. 
+    # if we face errors, we resort to NtDll loading instead
+    with suppress(AttributeError):
+        return WinAPI("LoadLibraryA", "kernel32")(module.lower())
+
+    if ida_inf.is_64bit():
+        ida_typeinf.add_til("ntapi64_win10", ida_typeinf.ADDTIL_DEFAULT)
+        func_addressing_size = 8
+    elif ida_inf.is_32bit():
+        ida_typeinf.add_til("ntapi_win10", ida_typeinf.ADDTIL_DEFAULT)
+        func_addressing_size = 4
+    else:
+        return None
+
+    size = idaapi.get_struc_size(ida_typeinf.import_type(None, -1, "UNICODE_STRING"))    
+
+    RtlCreateHeap = WinAPI("RtlCreateHeap", "ntdll")
+    RtlAllocateHeap = WinAPI("RtlAllocateHeap", "ntdll")
     
-    # # convert module to wide string, but im lazy to implement so we assume wide string
+    module = module.encode('utf-16le')
 
-    # heap = RtlCreateHeap(0, 0, 0, 0, 0, 0)
-    # ea = RtlAllocateHeap(heap, 0, size)
-    # buf_ea = RtlAllocateHeap(heap, 0, len(module))
+    heap = RtlCreateHeap(0, 0, 0, 0, 0, 0)
+    ea = RtlAllocateHeap(heap, 0, size)
+    buf_ea = RtlAllocateHeap(heap, 0, len(module))
     
-    # tp = ida_idd.Appcall.typedobj(f"struct {{char value[{len(module)}];}};")
-    # obj = ida_idd.Appcall.obj(value = module)
-    # tp.store(obj, buf_ea)
+    tp = ida_idd.Appcall.typedobj(f"struct {{char value[{len(module)}];}};")
+    obj = ida_idd.Appcall.obj(value = module)
+    tp.store(obj, buf_ea)
 
-    # tp = ida_idd.Appcall.typedobj("typedef UNICODE_STRING a;")
-    # obj = ida_idd.Appcall.obj(Length = len(module), MaximumLength = len(module) + 2, Buffer = buf_ea)
-    # tp.store(obj, ea)
+    tp = ida_idd.Appcall.typedobj("typedef UNICODE_STRING a;")
+    obj = ida_idd.Appcall.obj(Length = len(module), MaximumLength = len(module) + 2, Buffer = buf_ea)
+    tp.store(obj, ea)
 
-    # handle_ea = RtlAllocateHeap(heap, 0, func_addressing_size)
-    # return WinAPI("ntdll.dll", "LdrLoadDll")(0, 0, ea, handle_ea)
-    return WinAPI("LoadLibraryA", "kernel32")(module.lower())
+    handle_ea = RtlAllocateHeap(heap, 0, func_addressing_size)
+    return WinAPI("LdrLoadDll", "ntdll")(0, 0, ea, handle_ea)
 
 class WinAPI(ida_idd.Appcall_callable__):
     """
@@ -126,7 +150,7 @@ class WinAPI(ida_idd.Appcall_callable__):
         ea = ida_name.get_name_ea(ida_idaapi.BADADDR, name)
         if ea != ida_idaapi.BADADDR:
             return ea
-            
+        
         LoadLibrary(self.module)
         return ida_name.get_name_ea(ida_idaapi.BADADDR, name)
     
@@ -134,7 +158,7 @@ class WinAPI(ida_idd.Appcall_callable__):
         cmp = self.procedure.encode('utf-8')
         for dll in self.WHITELIST_DLL:
             if cmp in self.EnumExports(dll):
-                return dll[:-4]        
+                return dll[:-4]
 
     @staticmethod
     def EnumExports(module):
@@ -168,19 +192,18 @@ class WinAPI(ida_idd.Appcall_callable__):
             return obj.value
         return obj
 
+    def hook(self):
+        ea = self.ea
 
-def hook_function(procedure, module = None):
-    ea = WinAPI(procedure, module).ea
-
-    if not ida_dbg.exist_bpt(ea):
-        ida_dbg.add_bpt(ea)
-    
-    bpt = ida_dbg.bpt_t()
-    ida_dbg.get_bpt(ea, bpt)
-    bpt.elang = 'Python'
-    bpt.condition = f'print(*get_function_args({ea}))\nreturn True'
-    
-    ida_dbg.update_bpt(bpt)
+        if not ida_dbg.exist_bpt(ea):
+            ida_dbg.add_bpt(ea)
+        
+        bpt = ida_dbg.bpt_t()
+        ida_dbg.get_bpt(ea, bpt)
+        bpt.elang = 'Python'
+        bpt.condition = f'print(*get_function_args({ea}))\nreturn True'
+        
+        ida_dbg.update_bpt(bpt)
 
 def get_function_args(ea, tif = None):
     if tif is None:
